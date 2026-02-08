@@ -1,0 +1,17 @@
+[project]
+name = "slide-converter"
+version = "1.0.0"
+description = "PDF/PPTX to structured HTML with embedded images"
+requires-python = ">=3.9"
+dependencies = [
+    "pymupdf>=1.24.0",
+    "python-pptx>=0.6.21",
+    "Pillow>=9.0.0",
+]
+
+[project.scripts]
+convert = "slide_converter:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
