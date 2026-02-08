@@ -1,16 +1,16 @@
 """
-convert — PDF/PPTX to structured HTML with embedded images.
+convert — PDF/PPTX to structured HTML or Markdown with embedded images.
 
 Uses font analysis for heading/body/math detection, bullet structure,
 and equation identification. Auto-renders pages with diagrams or equations
-as images to guarantee visual accuracy. Outputs single-file HTML with
-base64-embedded images.
+as images to guarantee visual accuracy.
 
 Usage:
-    convert lecture.pdf                     # smart render (auto-detects pages)
+    convert lecture.pdf                     # → lecture.html (default)
+    convert lecture.pdf --md                # → lecture.md
+    convert lecture.pdf -o notes.md         # auto-detects format from extension
     convert lecture.pdf --render            # render ALL pages as images
-    convert lecture.pdf --no-render         # text-only (smallest file)
-    convert lecture.pdf -o out.html         # custom output name
+    convert lecture.pdf --no-render         # text only (smallest file)
     convert file1.pdf file2.pdf -o all.html # merge multiple files
 """
 import sys
@@ -34,13 +34,27 @@ try:
 except ImportError:
     HAS_PPTX = False
 
-# Fonts that indicate math/equation content
+# --- Constants ---------------------------------------------------------------
+
 MATH_FONTS = ("CambriaMath", "Cambria Math", "MT-Extra", "Symbol")
 
-# Render modes
-RENDER_AUTO = "auto"     # render pages with diagrams/math (default)
-RENDER_ALL = "all"       # render every page
-RENDER_NONE = "none"     # no renders
+RENDER_AUTO = "auto"
+RENDER_ALL = "all"
+RENDER_NONE = "none"
+
+FMT_HTML = "html"
+FMT_MD = "md"
+
+# Element types
+TITLE = "title"
+BULLET = "bullet"
+EQUATION = "equation"
+CODE = "code"
+LABEL = "label"
+BODY = "body"
+IMAGE = "image"
+RENDER = "render"
+TABLE = "table"
 
 CSS = """\
 body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; max-width: 960px; margin: 40px auto; padding: 20px; line-height: 1.7; color: #1a1a1a; }
@@ -71,6 +85,8 @@ details.render summary { cursor: pointer; color: #888; font-size: 0.82em; }
 """
 
 
+# --- Helpers -----------------------------------------------------------------
+
 def esc(text):
     return html_mod.escape(text)
 
@@ -79,8 +95,42 @@ def is_math(font_name):
     return any(m in font_name for m in MATH_FONTS)
 
 
+def el(etype, **kw):
+    """Create an element dict."""
+    return {"type": etype, **kw}
+
+
+def plain_text(spans):
+    """Extract plain text from spans."""
+    return "".join(s["text"] for s in spans).strip()
+
+
+def strip_bullet_char(spans):
+    """Return spans with the leading bullet character removed."""
+    out = []
+    stripped = False
+    for s in spans:
+        if not stripped:
+            t = s["text"].lstrip()
+            if t and t[0] in "\u2022\u2023\u25cf\u25cb\u2013\u2014\u2012":
+                t = t[1:].lstrip()
+                if t:
+                    out.append({**s, "text": t})
+                stripped = True
+                continue
+            elif t:
+                out.append(s)
+                stripped = True
+                continue
+        else:
+            out.append(s)
+    return out if out else spans
+
+
+# --- Span renderers ---------------------------------------------------------
+
 def spans_to_html(spans):
-    """Render a list of text spans to HTML with math/bold/italic detection."""
+    """Render spans to HTML."""
     parts = []
     for s in spans:
         t = s["text"]
@@ -101,56 +151,36 @@ def spans_to_html(spans):
     return "".join(parts)
 
 
-def strip_bullet(html_text, char):
-    """Remove first occurrence of a bullet character from HTML text."""
-    for c in [char, esc(char)]:
-        if c in html_text:
-            return html_text.replace(c, "", 1).strip()
-    return html_text.strip()
-
-
-def render_page(page, page_num):
-    """Render a page to a base64-encoded PNG image tag."""
-    pix = page.get_pixmap(dpi=120)
-    b64 = base64.b64encode(pix.tobytes("png")).decode()
-    return (
-        f'<img class="slide-img" src="data:image/png;base64,{b64}" '
-        f'alt="Slide {page_num + 1}">'
-    )
-
-
-def page_needs_render(page):
-    """Check if a page has significant vector content or math that needs rendering."""
-    # Check for vector drawings (diagrams)
-    drawings = page.get_drawings()
-    has_diagrams = len(drawings) > 4
-
-    # Check for math fonts (garbled Unicode in browsers)
-    has_math = False
-    for block in page.get_text("dict")["blocks"]:
-        if block["type"] != 0:
+def spans_to_md(spans):
+    """Render spans to Markdown."""
+    parts = []
+    for s in spans:
+        t = s["text"]
+        if not t:
             continue
-        for line in block["lines"]:
-            for span in line["spans"]:
-                if span["text"].strip() and is_math(span["font"]):
-                    has_math = True
-                    break
-            if has_math:
-                break
-        if has_math:
-            break
+        font = s["font"]
+        # Escape markdown special chars in text (but not formatting we add)
+        escaped = t.replace("\\", "\\\\")
+        for ch in "*_`[]()#>":
+            escaped = escaped.replace(ch, f"\\{ch}")
+        if is_math(font):
+            parts.append(t)  # keep math Unicode as-is, no escaping
+        elif "Bold" in font and "Italic" in font:
+            parts.append(f"***{escaped}***")
+        elif "Bold" in font:
+            parts.append(f"**{escaped}**")
+        elif "Italic" in font:
+            parts.append(f"*{escaped}*")
+        else:
+            parts.append(escaped)
+    return "".join(parts)
 
-    return has_diagrams or has_math
 
-
-# ---------------------------------------------------------------------------
-# PDF extraction
-# ---------------------------------------------------------------------------
+# --- PDF extraction (format-agnostic) ---------------------------------------
 
 def analyze_pdf_fonts(doc):
-    """First pass: determine adaptive font-size thresholds from the document."""
+    """Determine adaptive font-size thresholds."""
     size_chars = Counter()
-
     for page in doc:
         for block in page.get_text("dict")["blocks"]:
             if block["type"] != 0:
@@ -160,99 +190,95 @@ def analyze_pdf_fonts(doc):
                     txt = span["text"].strip()
                     if txt:
                         size_chars[round(span["size"])] += len(txt)
-
     if not size_chars:
         return {"title": 40, "body": 24}
-
     sorted_sizes = sorted(size_chars.keys(), reverse=True)
-    body = size_chars.most_common(1)[0][0]
-    title = sorted_sizes[0]
-
-    return {"title": title, "body": body}
+    return {"title": sorted_sizes[0], "body": size_chars.most_common(1)[0][0]}
 
 
-def postprocess_parts(parts):
-    """Post-process HTML parts: merge equations, detect code blocks."""
+def page_needs_render(page):
+    """Check if a page has diagrams or math needing a visual render."""
+    if len(page.get_drawings()) > 4:
+        return True
+    for block in page.get_text("dict")["blocks"]:
+        if block["type"] != 0:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                if span["text"].strip() and is_math(span["font"]):
+                    return True
+    return False
+
+
+def postprocess_elements(elements):
+    """Merge consecutive equations; detect code blocks from labels."""
     result = []
     i = 0
-    while i < len(parts):
-        # --- Merge consecutive equation divs ---
-        if parts[i].startswith('<div class="eq">'):
-            eq_contents = []
-            j = i
-            while j < len(parts) and parts[j].startswith('<div class="eq">'):
-                inner = parts[j][len('<div class="eq">'):-len("</div>")]
-                eq_contents.append(inner)
+    while i < len(elements):
+        e = elements[i]
+
+        # Merge consecutive equations
+        if e["type"] == EQUATION:
+            merged_spans = list(e["spans"])
+            j = i + 1
+            while j < len(elements) and elements[j]["type"] == EQUATION:
+                merged_spans.extend(elements[j]["spans"])
                 j += 1
-            if len(eq_contents) > 1:
-                result.append('<div class="eq">' + " ".join(eq_contents) + "</div>")
+            if j > i + 1:
+                result.append(el(EQUATION, spans=merged_spans))
             else:
-                result.append(parts[i])
+                result.append(e)
             i = j
             continue
 
-        # --- Detect code blocks in consecutive label lines ---
-        if parts[i].startswith('<p class="label">') and parts[i].endswith("</p>"):
+        # Detect code in consecutive labels
+        if e["type"] == LABEL:
             j = i
-            label_lines = []
-            while (
-                j < len(parts)
-                and parts[j].startswith('<p class="label">')
-                and parts[j].endswith("</p>")
-            ):
-                inner = parts[j][len('<p class="label">'):-len("</p>")]
-                label_lines.append(inner)
+            labels = []
+            while j < len(elements) and elements[j]["type"] == LABEL:
+                labels.append(elements[j])
                 j += 1
-            code_indicators = sum(
-                1 for line in label_lines if ";" in line or "=" in line or "(" in line
-            )
-            if len(label_lines) >= 3 and code_indicators >= 2:
-                result.append(
-                    "<pre><code>" + "\n".join(label_lines) + "</code></pre>"
-                )
+            texts = [plain_text(lb["spans"]) for lb in labels]
+            code_hits = sum(1 for t in texts if ";" in t or "=" in t or "(" in t)
+            if len(labels) >= 3 and code_hits >= 2:
+                result.append(el(CODE, lines=texts))
             else:
-                result.extend(parts[i:j])
+                result.extend(labels)
             i = j
             continue
 
-        result.append(parts[i])
+        result.append(e)
         i += 1
     return result
 
 
-def pdf_page_html(page, page_num, doc, fs):
-    """Convert a single PDF page to structured HTML parts (text only)."""
-    parts = []
+def extract_pdf_page(page, page_num, doc, fs):
+    """Extract a PDF page into a list of elements and a slide title."""
+    elements = []
     d = page.get_text("dict")
     page_h = d["height"]
 
     list_depth = 0
-    current_li = None
+    current_bullet = None  # index into elements of the open bullet
     title_emitted = False
     slide_title = None
 
-    def close_li():
-        nonlocal current_li
-        if current_li is not None:
-            parts[current_li] += "</li>"
-            current_li = None
+    def close_bullet():
+        nonlocal current_bullet
+        current_bullet = None
 
     def close_lists():
         nonlocal list_depth
-        close_li()
-        while list_depth > 0:
-            parts.append("</ul>")
-            list_depth -= 1
+        close_bullet()
+        list_depth = 0
 
     for block in d["blocks"]:
         if block["type"] != 0:
             continue
-
         for line in block["lines"]:
             spans = [s for s in line["spans"] if s["text"].strip()]
             if not spans:
                 continue
-
             text = "".join(s["text"] for s in spans).strip()
             if not text:
                 continue
@@ -260,319 +286,450 @@ def pdf_page_html(page, page_num, doc, fs):
             max_sz = max(s["size"] for s in spans)
             y = line["bbox"][1]
             all_math = all(is_math(s["font"]) for s in spans)
-            html_t = spans_to_html(spans)
 
-            # --- Skip page numbers ---
+            # Skip page numbers
             if max_sz < 15 and y > page_h * 0.80 and text.strip().isdigit():
                 continue
 
-            # --- Slide title ---
+            # Title
             if max_sz >= fs["title"] - 2 and not title_emitted:
                 close_lists()
                 slide_title = text
-                parts.append(
-                    f'<h2 class="slide-title" id="slide-{page_num + 1}">{html_t}</h2>'
-                )
+                elements.append(el(TITLE, spans=list(spans), page_num=page_num))
                 title_emitted = True
                 continue
 
-            # --- Top-level bullet ---
-            if len(text) > 0 and text[0] in "\u2022\u2023\u25cf\u25cb":
-                close_li()
-                while list_depth > 1:
-                    parts.append("</ul>")
-                    list_depth -= 1
-                if list_depth == 0:
-                    parts.append("<ul>")
+            # Top-level bullet
+            if text[0] in "\u2022\u2023\u25cf\u25cb":
+                close_bullet()
+                if list_depth > 1:
                     list_depth = 1
-                current_li = len(parts)
-                parts.append(f"<li>{strip_bullet(html_t, text[0])}")
+                if list_depth == 0:
+                    list_depth = 1
+                current_bullet = len(elements)
+                elements.append(el(BULLET, spans=strip_bullet_char(spans), level=0))
                 continue
 
-            # --- Sub-bullet ---
-            if len(text) > 0 and text[0] in "\u2013\u2014\u2012":
-                close_li()
-                if list_depth == 0:
-                    parts.append("<ul>")
+            # Sub-bullet
+            if text[0] in "\u2013\u2014\u2012":
+                close_bullet()
+                if list_depth < 1:
                     list_depth = 1
-                if list_depth == 1:
-                    parts.append("<ul>")
-                    list_depth = 2
-                current_li = len(parts)
-                parts.append(f"<li>{strip_bullet(html_t, text[0])}")
+                list_depth = 2
+                current_bullet = len(elements)
+                elements.append(el(BULLET, spans=strip_bullet_char(spans), level=1))
                 continue
 
-            # --- Equation block ---
+            # Equation
             if all_math:
-                close_li()
-                parts.append(f'<div class="eq">{html_t}</div>')
+                close_bullet()
+                elements.append(el(EQUATION, spans=list(spans)))
                 continue
 
-            # --- Small text ---
+            # Small text / label
             if max_sz < fs["body"] - 6 and max_sz < fs["title"] - 10:
                 close_lists()
-                parts.append(f'<p class="label">{html_t}</p>')
+                elements.append(el(LABEL, spans=list(spans)))
                 continue
 
-            # --- Body / continuation ---
-            if current_li is not None:
-                parts[current_li] += " " + html_t
+            # Body / continuation
+            if current_bullet is not None:
+                elements[current_bullet]["spans"].extend(spans)
             elif list_depth > 0:
-                current_li = len(parts)
-                parts.append(f"<li>{html_t}")
+                current_bullet = len(elements)
+                elements.append(el(BULLET, spans=list(spans), level=list_depth - 1))
             else:
-                parts.append(f"<p>{html_t}</p>")
+                elements.append(el(BODY, spans=list(spans)))
 
     close_lists()
 
-    # --- Embed extracted raster images ---
+    # Raster images
     for idx, img_info in enumerate(page.get_images()):
         try:
             xref = img_info[0]
             bi = doc.extract_image(xref)
-            b64 = base64.b64encode(bi["image"]).decode()
-            parts.append(
-                f'<img src="data:image/{bi["ext"]};base64,{b64}" '
-                f'alt="Slide {page_num + 1} Figure {idx + 1}">'
-            )
+            elements.append(el(
+                IMAGE,
+                data=base64.b64encode(bi["image"]).decode(),
+                ext=bi["ext"],
+                alt=f"Slide {page_num + 1} Figure {idx + 1}",
+            ))
         except Exception:
             pass
 
-    parts = postprocess_parts(parts)
-    return parts, slide_title
+    elements = postprocess_elements(elements)
+    return elements, slide_title
 
 
-def convert_pdf(pdf_path, render_mode=RENDER_AUTO):
-    """Convert a PDF file to HTML content."""
+def extract_pdf(pdf_path, render_mode):
+    """Extract all pages from a PDF. Returns (toc, list_of_page_elements)."""
     doc = pymupdf.open(str(pdf_path))
     fs = analyze_pdf_fonts(doc)
     n = len(doc)
     print(f"  {n} pages | title={fs['title']}pt body={fs['body']}pt")
 
-    toc_entries = []
-    body_parts = []
-    rendered_count = 0
+    toc = []
+    pages = []
+    rendered = 0
 
     for pn in range(n):
         page = doc[pn]
-        page_html, title = pdf_page_html(page, pn, doc, fs)
+        elems, title = extract_pdf_page(page, pn, doc, fs)
 
-        # Determine if this page needs a visual render
-        should_render = False
-        if render_mode == RENDER_ALL:
-            should_render = True
-        elif render_mode == RENDER_AUTO:
-            should_render = page_needs_render(page)
-
+        should_render = (
+            render_mode == RENDER_ALL
+            or (render_mode == RENDER_AUTO and page_needs_render(page))
+        )
         if should_render:
-            page_html.append(render_page(page, pn))
-            rendered_count += 1
+            pix = page.get_pixmap(dpi=120)
+            elems.append(el(
+                RENDER,
+                data=base64.b64encode(pix.tobytes("png")).decode(),
+                alt=f"Slide {pn + 1}",
+            ))
+            rendered += 1
 
-        if title:
-            toc_entries.append((pn + 1, title))
-        elif not toc_entries or toc_entries[-1][0] != pn + 1:
-            toc_entries.append((pn + 1, f"Slide {pn + 1}"))
-
-        body_parts.append('<section class="slide">')
-        body_parts.extend(page_html)
-        body_parts.append("</section>")
-
+        toc.append((pn + 1, title or f"Slide {pn + 1}"))
+        pages.append(elems)
         print(f"  Page {pn + 1}/{n}\r", end="", flush=True)
 
     doc.close()
     print()
-
-    if rendered_count > 0:
-        print(f"  {rendered_count}/{n} pages rendered as images")
-
-    # Build table of contents
-    toc_html = '<nav><details open><summary>Table of Contents</summary><ol>'
-    for pn, title in toc_entries:
-        toc_html += f'<li><a href="#slide-{pn}">{esc(title)}</a></li>'
-    toc_html += "</ol></details></nav>"
-
-    return toc_html + "\n" + "\n".join(body_parts)
+    if rendered:
+        print(f"  {rendered}/{n} pages rendered as images")
+    return toc, pages
 
 
-# ---------------------------------------------------------------------------
-# PPTX extraction
-# ---------------------------------------------------------------------------
+# --- PPTX extraction (format-agnostic) --------------------------------------
 
-def pptx_shape_sort_key(shape):
-    """Sort shapes top-to-bottom, left-to-right."""
-    return (shape.top or 0, shape.left or 0)
-
-
-def convert_pptx(pptx_path):
-    """Convert a PPTX file to HTML content."""
+def extract_pptx(pptx_path):
+    """Extract all slides from a PPTX. Returns (toc, list_of_slide_elements)."""
     if not HAS_PPTX:
         print("  ERROR: python-pptx not installed. Run: pip install python-pptx")
-        return ""
+        return [], []
 
     prs = Presentation(str(pptx_path))
     n = len(prs.slides)
     print(f"  {n} slides")
 
-    toc_entries = []
-    body_parts = []
+    toc = []
+    pages = []
 
     for sn, slide in enumerate(prs.slides, 1):
-        parts = []
+        elems = []
         slide_title = None
-
-        shapes = sorted(slide.shapes, key=pptx_shape_sort_key)
+        shapes = sorted(slide.shapes, key=lambda s: (s.top or 0, s.left or 0))
 
         for shape in shapes:
+            # Tables
             if shape.has_table:
                 tbl = shape.table
-                parts.append("<table>")
-                for ri, row in enumerate(tbl.rows):
-                    parts.append("<tr>")
-                    for cell in row.cells:
-                        tag = "th" if ri == 0 else "td"
-                        parts.append(f"<{tag}>{esc(cell.text)}</{tag}>")
-                    parts.append("</tr>")
-                parts.append("</table>")
+                rows = []
+                for row in tbl.rows:
+                    rows.append([cell.text for cell in row.cells])
+                elems.append(el(TABLE, rows=rows))
                 continue
 
+            # Images
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 try:
-                    blob = shape.image.blob
-                    ext = shape.image.ext
-                    b64 = base64.b64encode(blob).decode()
-                    parts.append(
-                        f'<img src="data:image/{ext};base64,{b64}" '
-                        f'alt="Slide {sn} Image">'
-                    )
+                    elems.append(el(
+                        IMAGE,
+                        data=base64.b64encode(shape.image.blob).decode(),
+                        ext=shape.image.ext,
+                        alt=f"Slide {sn} Image",
+                    ))
                 except Exception:
                     pass
                 continue
 
+            # Text
             if not shape.has_text_frame or not shape.text.strip():
                 continue
 
             is_title_shape = False
             try:
                 if shape.placeholder_format is not None:
-                    idx = shape.placeholder_format.idx
-                    is_title_shape = idx in (0, 1)
+                    is_title_shape = shape.placeholder_format.idx in (0, 1)
             except Exception:
                 pass
 
-            tf = shape.text_frame
-            in_list = False
-
-            for para in tf.paragraphs:
-                para_text = para.text.strip()
-                if not para_text:
+            for para in shape.text_frame.paragraphs:
+                if not para.text.strip():
                     continue
 
-                run_parts = []
+                # Build fake spans from runs (same structure as PDF spans)
+                spans = []
                 for run in para.runs:
-                    t = esc(run.text)
-                    if not t:
+                    if not run.text:
                         continue
+                    font_name = "Normal"
                     try:
-                        if run.font.bold:
-                            t = f"<strong>{t}</strong>"
-                        if run.font.italic:
-                            t = f"<em>{t}</em>"
+                        if run.font.bold and run.font.italic:
+                            font_name = "BoldItalic"
+                        elif run.font.bold:
+                            font_name = "Bold"
+                        elif run.font.italic:
+                            font_name = "Italic"
                     except Exception:
                         pass
-                    run_parts.append(t)
+                    spans.append({"text": run.text, "font": font_name, "size": 24})
 
-                para_html = "".join(run_parts) if run_parts else esc(para_text)
+                if not spans:
+                    spans = [{"text": para.text, "font": "Normal", "size": 24}]
 
                 if is_title_shape and slide_title is None:
-                    slide_title = para_text
-                    parts.append(
-                        f'<h2 class="slide-title" id="slide-{sn}">{para_html}</h2>'
-                    )
+                    slide_title = para.text.strip()
+                    elems.append(el(TITLE, spans=spans, page_num=sn - 1))
                     is_title_shape = False
                 elif para.level > 0:
-                    if not in_list:
-                        parts.append("<ul>")
-                        in_list = True
-                    parts.append(f"<li>{para_html}</li>")
+                    elems.append(el(BULLET, spans=spans, level=min(para.level, 1)))
                 else:
-                    if in_list:
-                        parts.append("</ul>")
-                        in_list = False
-                    parts.append(f"<p>{para_html}</p>")
+                    elems.append(el(BODY, spans=spans))
 
-            if in_list:
-                parts.append("</ul>")
-
-        if slide_title:
-            toc_entries.append((sn, slide_title))
-        else:
-            toc_entries.append((sn, f"Slide {sn}"))
-
-        body_parts.append('<section class="slide">')
-        body_parts.extend(parts)
-        body_parts.append("</section>")
-
+        toc.append((sn, slide_title or f"Slide {sn}"))
+        pages.append(elems)
         print(f"  Slide {sn}/{n}\r", end="", flush=True)
 
     print()
+    return toc, pages
 
+
+# --- HTML renderer -----------------------------------------------------------
+
+def elements_to_html(elements):
+    """Render a list of elements to HTML."""
+    parts = []
+    in_list = 0  # nesting depth
+
+    def ensure_list(level):
+        nonlocal in_list
+        target = level + 1
+        while in_list < target:
+            parts.append("<ul>")
+            in_list += 1
+        while in_list > target:
+            parts.append("</ul>")
+            in_list -= 1
+
+    def close_list():
+        nonlocal in_list
+        while in_list > 0:
+            parts.append("</ul>")
+            in_list -= 1
+
+    for e in elements:
+        t = e["type"]
+
+        if t == TITLE:
+            close_list()
+            pn = e["page_num"] + 1
+            parts.append(
+                f'<h2 class="slide-title" id="slide-{pn}">'
+                f"{spans_to_html(e['spans'])}</h2>"
+            )
+
+        elif t == BULLET:
+            ensure_list(e["level"])
+            parts.append(f"<li>{spans_to_html(e['spans'])}</li>")
+
+        elif t == EQUATION:
+            close_list()
+            parts.append(f'<div class="eq">{spans_to_html(e["spans"])}</div>')
+
+        elif t == CODE:
+            close_list()
+            parts.append(
+                "<pre><code>"
+                + "\n".join(esc(line) for line in e["lines"])
+                + "</code></pre>"
+            )
+
+        elif t == LABEL:
+            close_list()
+            parts.append(f'<p class="label">{spans_to_html(e["spans"])}</p>')
+
+        elif t == BODY:
+            close_list()
+            parts.append(f"<p>{spans_to_html(e['spans'])}</p>")
+
+        elif t == IMAGE:
+            close_list()
+            parts.append(
+                f'<img src="data:image/{e["ext"]};base64,{e["data"]}" '
+                f'alt="{esc(e["alt"])}">'
+            )
+
+        elif t == RENDER:
+            close_list()
+            parts.append(
+                f'<img class="slide-img" src="data:image/png;base64,{e["data"]}" '
+                f'alt="{esc(e["alt"])}">'
+            )
+
+        elif t == TABLE:
+            close_list()
+            parts.append("<table>")
+            for ri, row in enumerate(e["rows"]):
+                parts.append("<tr>")
+                tag = "th" if ri == 0 else "td"
+                for cell in row:
+                    parts.append(f"<{tag}>{esc(cell)}</{tag}>")
+                parts.append("</tr>")
+            parts.append("</table>")
+
+    close_list()
+    return "\n".join(parts)
+
+
+def assemble_html(title, toc, pages_html):
+    """Build a full HTML document."""
     toc_html = '<nav><details open><summary>Table of Contents</summary><ol>'
-    for sn, title in toc_entries:
-        toc_html += f'<li><a href="#slide-{sn}">{esc(title)}</a></li>'
+    for pn, t in toc:
+        toc_html += f'<li><a href="#slide-{pn}">{esc(t)}</a></li>'
     toc_html += "</ol></details></nav>"
 
-    return toc_html + "\n" + "\n".join(body_parts)
+    body = toc_html + "\n"
+    for page_html in pages_html:
+        body += f'<section class="slide">\n{page_html}\n</section>\n'
+
+    return (
+        f"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        f"<meta charset=\"UTF-8\">\n<title>{esc(title)}</title>\n"
+        f"<style>\n{CSS}</style>\n</head>\n<body>\n"
+        f"<h1>{esc(title)}</h1>\n{body}</body>\n</html>"
+    )
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- Markdown renderer -------------------------------------------------------
 
-def convert_file(path, render_mode=RENDER_AUTO):
-    """Convert a single file and return (html_content, filename)."""
+def elements_to_md(elements):
+    """Render a list of elements to Markdown."""
+    lines = []
+
+    for e in elements:
+        t = e["type"]
+
+        if t == TITLE:
+            lines.append(f"## {spans_to_md(e['spans'])}")
+            lines.append("")
+
+        elif t == BULLET:
+            indent = "  " * e["level"]
+            lines.append(f"{indent}- {spans_to_md(e['spans'])}")
+
+        elif t == EQUATION:
+            lines.append("")
+            lines.append(f"> {plain_text(e['spans'])}")
+            lines.append("")
+
+        elif t == CODE:
+            lines.append("")
+            lines.append("```")
+            lines.extend(e["lines"])
+            lines.append("```")
+            lines.append("")
+
+        elif t == LABEL:
+            lines.append(f"*{spans_to_md(e['spans'])}*")
+
+        elif t == BODY:
+            lines.append("")
+            lines.append(spans_to_md(e["spans"]))
+            lines.append("")
+
+        elif t == IMAGE:
+            lines.append("")
+            lines.append(f'![{e["alt"]}](data:image/{e["ext"]};base64,{e["data"]})')
+            lines.append("")
+
+        elif t == RENDER:
+            lines.append("")
+            lines.append(f'![{e["alt"]}](data:image/png;base64,{e["data"]})')
+            lines.append("")
+
+        elif t == TABLE:
+            lines.append("")
+            header = e["rows"][0] if e["rows"] else []
+            lines.append("| " + " | ".join(header) + " |")
+            lines.append("| " + " | ".join("---" for _ in header) + " |")
+            for row in e["rows"][1:]:
+                lines.append("| " + " | ".join(row) + " |")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def assemble_md(title, toc, pages_md):
+    """Build a full Markdown document."""
+    lines = [f"# {title}", ""]
+
+    # Table of contents
+    lines.append("## Table of Contents")
+    lines.append("")
+    for pn, t in toc:
+        lines.append(f"{pn}. [{t}](#slide-{pn})")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for page_md in pages_md:
+        lines.append(page_md)
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# --- Main pipeline -----------------------------------------------------------
+
+def convert_file(path, render_mode, fmt):
+    """Convert a single file. Returns (content_string, filename)."""
     p = Path(path)
     ext = p.suffix.lower()
     print(f"Converting: {p.name}")
 
     if ext == ".pdf":
-        return convert_pdf(p, render_mode=render_mode), p.stem
+        toc, pages_elements = extract_pdf(p, render_mode)
     elif ext == ".pptx":
-        return convert_pptx(p), p.stem
+        toc, pages_elements = extract_pptx(p)
     else:
         print(f"  ERROR: Unsupported format '{ext}'. Use .pdf or .pptx")
         sys.exit(1)
 
-
-def wrap_html(title, body):
-    """Wrap content in full HTML document."""
-    return (
-        f"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
-        f"<meta charset=\"UTF-8\">\n<title>{esc(title)}</title>\n"
-        f"<style>\n{CSS}</style>\n</head>\n<body>\n"
-        f"<h1>{esc(title)}</h1>\n{body}\n</body>\n</html>"
-    )
+    if fmt == FMT_HTML:
+        pages_rendered = [elements_to_html(elems) for elems in pages_elements]
+        return assemble_html(p.stem, toc, pages_rendered), p.stem
+    else:
+        pages_rendered = [elements_to_md(elems) for elems in pages_elements]
+        return assemble_md(p.stem, toc, pages_rendered), p.stem
 
 
 def main():
     args = sys.argv[1:]
 
     if not args or args[0] in ("-h", "--help"):
-        print("Usage: convert [options] <file1> [file2 ...] [-o output.html]")
+        print("Usage: convert [options] <file1> [file2 ...] [-o output.html|.md]")
         print()
         print("Options:")
+        print("  --md          Output Markdown instead of HTML")
         print("  --render      Render ALL pages as images (largest file)")
         print("  --no-render   Text extraction only, no page renders (smallest file)")
-        print("  -o FILE       Output file (default: <input>.html)")
+        print("  -o FILE       Output file (.html or .md auto-detected from extension)")
         print()
-        print("Default: auto-renders pages with diagrams or equations (~40-60% of pages)")
+        print("Default: HTML with auto-rendered pages for diagrams/equations")
         print()
         print("Examples:")
         print('  convert "SPCE5025 Class 3.pdf"')
+        print('  convert lecture.pdf --md')
         print('  convert lecture.pdf --render')
+        print('  convert lecture.pdf -o notes.md')
         print('  convert week1.pdf week2.pdf -o combined.html')
         sys.exit(0)
 
-    # Parse arguments
+    # Parse flags
+    use_md = "--md" in args
+    args = [a for a in args if a != "--md"]
+
     if "--render" in args:
         render_mode = RENDER_ALL
         args = [a for a in args if a != "--render"]
@@ -597,39 +754,53 @@ def main():
         if not f.exists():
             print(f"Error: File not found: {f}")
             sys.exit(1)
-
     if not input_files:
         print("Error: No input files specified")
         sys.exit(1)
 
-    # Convert
-    sections = []
-    for f in input_files:
-        content, name = convert_file(f, render_mode=render_mode)
-        if len(input_files) > 1:
-            content = f'<h1 id="file-{esc(name)}">{esc(name)}</h1>\n{content}'
-        sections.append((content, name))
+    # Determine output format
+    if output_path and Path(output_path).suffix.lower() == ".md":
+        fmt = FMT_MD
+    elif use_md:
+        fmt = FMT_MD
+    else:
+        fmt = FMT_HTML
 
-    # Determine output
+    # Determine output path
     if output_path:
         out = Path(output_path)
     elif len(input_files) == 1:
-        out = input_files[0].with_suffix(".html")
+        out = input_files[0].with_suffix(".md" if fmt == FMT_MD else ".html")
     else:
-        out = Path("combined.html")
+        out = Path("combined.md" if fmt == FMT_MD else "combined.html")
 
-    # Build document
+    # Convert
+    sections = []
+    for f in input_files:
+        content, name = convert_file(f, render_mode, fmt)
+        sections.append((content, name))
+
+    # Merge if multiple files
     if len(sections) == 1:
-        title = sections[0][1]
-        body = sections[0][0]
+        output = sections[0][0]
     else:
-        title = "Combined: " + ", ".join(s[1] for s in sections)
-        body = "\n<hr>\n".join(s[0] for s in sections)
-
-    html = wrap_html(title, body)
+        if fmt == FMT_HTML:
+            title = "Combined: " + ", ".join(s[1] for s in sections)
+            merged = "\n<hr>\n".join(s[0] for s in sections)
+            output = (
+                f"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+                f"<meta charset=\"UTF-8\">\n<title>{esc(title)}</title>\n"
+                f"<style>\n{CSS}</style>\n</head>\n<body>\n"
+                f"<h1>{esc(title)}</h1>\n{merged}\n</body>\n</html>"
+            )
+        else:
+            parts = []
+            for content, name in sections:
+                parts.append(f"# {name}\n\n{content}")
+            output = "\n\n---\n\n".join(parts)
 
     with open(out, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(output)
 
     size_mb = out.stat().st_size / 1024 / 1024
     print(f"\nDone: {out} ({size_mb:.1f} MB)")
